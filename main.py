@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import urllib.parse
 import pandas as pd
 import plotly.express as px
 import requests
@@ -8,7 +9,7 @@ import streamlit as st
 # 1. 스트림릿 페이지 기본 설정
 # ------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="박스오피스 탐색기",
+    page_title="박스오피스 종합 탐색기",
     page_icon="🎬",
     layout="wide"
 )
@@ -82,7 +83,7 @@ def fetch_weekly_box_office(key: str, dt: str, week_gb: str = "0"):
         return None, str(e)
 
 
-# 3) 영화 상세 정보 API 호출
+# 3) 영화 상세 정보 API 호출 (24시간 캐싱)
 @st.cache_data(ttl=86400)
 def fetch_movie_detail(key: str, movie_cd: str):
     url = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/movie/searchMovieInfo.json"
@@ -111,7 +112,6 @@ def render_box_office_dashboard(raw_data, req_err, tab_name):
     box_result = raw_data.get("boxOfficeResult", {})
     box_list = box_result.get("dailyBoxOfficeList") or box_result.get("weeklyBoxOfficeList", [])
 
-    # 영화 목록이 비어있는 경우 요청된 문구 출력
     if not box_list:
         st.warning("그날은 아직 집계 전입니다")
         return
@@ -126,176 +126,58 @@ def render_box_office_dashboard(raw_data, req_err, tab_name):
     df["salesShare"] = df["salesShare"].astype(float)
 
     # --------------------------------------------------------------------------
-    # [1] 1위 영화 하이라이트 지표 카드
+    # [데이터 보강] 영화 상세 정보 연동 (장르, 관람등급, 스크린당 관객수 연산)
     # --------------------------------------------------------------------------
-    top1 = df.iloc[0]
+    genres_list = []
+    ratings_list = []
+    
+    for m_code in df["movieCd"]:
+        d_info, _ = fetch_movie_detail(api_key, m_code)
+        if d_info:
+            g_str = ", ".join([g["genreNm"] for g in d_info.get("genres", [])]) or "기타"
+            r_str = d_info.get("audits", [{}])[0].get("watchGradeNm", "정보 없음") if d_info.get("audits") else "정보 없음"
+        else:
+            g_str, r_str = "기타", "정보 없음"
+        genres_list.append(g_str)
+        ratings_list.append(r_str)
+
+    df["genres"] = genres_list
+    df["rating"] = ratings_list
+    # 스크린당 관객수 (알짜 흥행 지표) 연산
+    df["audi_per_scrn"] = (df["audiCnt"] / df["scrnCnt"].replace(0, 1)).round(1)
+
+    # --------------------------------------------------------------------------
+    # [필터링 UI] (기능 4: 관람등급 & 장르 필터)
+    # --------------------------------------------------------------------------
+    with st.expander("🎯 관람등급 및 장르 필터링 설정", expanded=False):
+        f_col1, f_col2 = st.columns(2)
+        
+        all_ratings = sorted(list(set(df["rating"])))
+        selected_ratings = f_col1.multiselect("관람등급 선택", options=all_ratings, default=all_ratings)
+
+        # 개별 장르 단어 추출
+        unique_genres = set()
+        for g_item in df["genres"]:
+            for g in g_item.split(", "):
+                if g: unique_genres.add(g)
+        all_genres = sorted(list(unique_genres))
+        selected_genres = f_col2.multiselect("장르 선택", options=all_genres, default=all_genres)
+
+    # 필터 적용
+    filtered_df = df[
+        df["rating"].isin(selected_ratings) &
+        df["genres"].apply(lambda x: any(g in x for g in selected_genres))
+    ].copy()
+
+    if filtered_df.empty:
+        st.warning("선택하신 조건(관람등급/장르)에 해당하는 영화가 없습니다. 필터를 변경해 주세요.")
+        return
+
+    # --------------------------------------------------------------------------
+    # [1] 주요 지표 카드 (1위 영화 + 스크린당 효율 1위 영화) - 기능 2
+    # --------------------------------------------------------------------------
+    top1 = filtered_df.iloc[0]
     rank_inten = top1["rankInten"]
     if rank_inten > 0:
         delta_text = f"🔺 +{rank_inten}"
         delta_color = "normal"
-    elif rank_inten < 0:
-        delta_text = f"🔵 -{abs(rank_inten)}"
-        delta_color = "inverse"
-    else:
-        delta_text = "NEW (신규)" if top1.get("rankOldAndNew") == "NEW" else "─ 변동 없음"
-        delta_color = "off"
-
-    st.subheader(f"🏆 {tab_name} 1위 영화")
-    m1, m2, m3 = st.columns(3)
-    
-    # 100만 관객 돌파 표기
-    top1_display_name = f"{top1['movieNm']} 🏆" if top1["audiAcc"] >= 1_000_000 else top1["movieNm"]
-    
-    m1.metric("🎬 영화명", top1_display_name, f"개봉일: {top1['openDt']}", delta_color="off")
-    m2.metric("🍿 해당 기간 관객수", f"{top1['audiCnt']:,} 명", delta_text, delta_color=delta_color)
-    m3.metric("🎟️ 누적 관객수", f"{top1['audiAcc']:,} 명", f"매출 점유율: {top1['salesShare']}%", delta_color="off")
-
-    st.write("")
-
-    # --------------------------------------------------------------------------
-    # [2] 시각화 차트 (관객수 막대 / 매출 점유율 파이)
-    # --------------------------------------------------------------------------
-    chart_col1, chart_col2 = st.columns(2)
-
-    with chart_col1:
-        st.markdown("##### 📊 관객수 상위 5개 영화")
-        top5_df = df.head(5).sort_values(by="rank", ascending=False)
-        fig_bar = px.bar(
-            top5_df,
-            x="audiCnt",
-            y="movieNm",
-            orientation="h",
-            text="audiCnt",
-            color="audiCnt",
-            color_continuous_scale="Purples"
-        )
-        fig_bar.update_traces(
-            texttemplate="%{text:,} 명",
-            textposition="outside",
-            hovertemplate="<b>%{y}</b><br>관객수: %{x:,} 명<extra></extra>"
-        )
-        fig_bar.update_layout(
-            xaxis_title="관객수 (명)",
-            yaxis_title="",
-            coloraxis_showscale=False,
-            height=360,
-            margin=dict(l=10, r=30, t=10, b=10)
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    with chart_col2:
-        st.markdown("##### 🥧 상위 10개 영화 매출액 점유율 (%)")
-        fig_pie = px.pie(
-            df.head(10),
-            values="salesShare",
-            names="movieNm",
-            hole=0.4,
-            color_discrete_sequence=px.colors.qualitative.Pastel
-        )
-        fig_pie.update_traces(
-            textinfo="percent+label",
-            hovertemplate="<b>%{label}</b><br>매출 점유율: %{value}%<extra></extra>"
-        )
-        fig_pie.update_layout(
-            showlegend=False,
-            height=360,
-            margin=dict(l=10, r=10, t=10, b=10)
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    st.write("")
-
-    # --------------------------------------------------------------------------
-    # [3] 전체 박스오피스 순위 표 (순위 변동 화살표 & 100만 관객 트로피 적용)
-    # --------------------------------------------------------------------------
-    st.markdown(f"##### 📋 {tab_name} 전체 순위 표")
-    
-    table_df = df.copy()
-
-    # 순위 변동 화살표 처리 (양수: 빨간 위 화살표 🔺 / 음수: 파란 아래 화살표 🔵)
-    def format_rank_change(row):
-        inten = row["rankInten"]
-        if row.get("rankOldAndNew") == "NEW":
-            return "🆕 NEW"
-        if inten > 0:
-            return f"🔺 +{inten}"
-        elif inten < 0:
-            return f"🔵 -{abs(inten)}"
-        else:
-            return "─"
-
-    table_df["순위 변동"] = table_df.apply(format_rank_change, axis=1)
-
-    # 100만 관객 돌파 영화 트로피(🏆) 추가
-    table_df["영화명_표시"] = table_df.apply(
-        lambda r: f"{r['movieNm']} 🏆" if r["audiAcc"] >= 1_000_000 else r["movieNm"], 
-        axis=1
-    )
-
-    display_table = table_df[["rank", "순위 변동", "영화명_표시", "openDt", "audiCnt", "audiAcc", "salesShare", "scrnCnt"]].copy()
-    display_table.columns = ["순위", "순위 변동", "영화명", "개봉일", "기간 관객수", "누적 관객수", "매출 점유율(%)", "스크린수"]
-
-    display_table["기간 관객수"] = display_table["기간 관객수"].apply(lambda x: f"{x:,} 명")
-    display_table["누적 관객수"] = display_table["누적 관객수"].apply(lambda x: f"{x:,} 명")
-    display_table["매출 점유율(%)"] = display_table["매출 점유율(%)"].apply(lambda x: f"{x:.1f} %")
-    display_table["스크린수"] = display_table["스크린수"].apply(lambda x: f"{x:,} 개")
-
-    st.dataframe(display_table, use_container_width=True, hide_index=True)
-
-    st.write("")
-
-    # --------------------------------------------------------------------------
-    # [4] 영화 상세 정보 조회
-    # --------------------------------------------------------------------------
-    st.markdown("##### 🔍 영화 상세 정보 조회")
-    movie_options = {f"{row['rank']}위 : {row['movieNm']}": row['movieCd'] for _, row in df.iterrows()}
-    
-    selected_movie_label = st.selectbox(
-        "상세 정보를 확인할 영화를 선택하세요",
-        options=list(movie_options.keys()),
-        key=f"select_{tab_name}"
-    )
-
-    if selected_movie_label:
-        selected_code = movie_options[selected_movie_label]
-        with st.spinner("영화 세부 정보를 가져오는 중입니다..."):
-            detail, detail_err = fetch_movie_detail(api_key, selected_code)
-
-        if detail_err or not detail:
-            st.warning("영화 상세 정보를 불러올 수 없습니다.")
-        else:
-            movie_nm_en = detail.get("movieNmEn", "")
-            show_tm = detail.get("showTm", "-")
-            
-            genres = ", ".join([g["genreNm"] for g in detail.get("genres", [])]) or "정보 없음"
-            directors = ", ".join([d["peopleNm"] for d in detail.get("directors", [])]) or "정보 없음"
-            actors = ", ".join([a["peopleNm"] for a in detail.get("actors", [])[:5]]) or "정보 없음"
-            audits = detail.get("audits", [{}])[0].get("watchGradeNm", "정보 없음") if detail.get("audits") else "정보 없음"
-            nations = ", ".join([n["nationNm"] for n in detail.get("nations", [])]) or "정보 없음"
-
-            st.info(f"""
-            🎬 **{detail.get('movieNm')}** ({movie_nm_en})
-            
-            • **장르**: {genres} | **제작국가**: {nations}  
-            • **상영시간**: {show_tm}분 | **관람등급**: {audits}  
-            • **감독**: {directors}  
-            • **주요 출연진**: {actors}
-            """)
-
-
-# ------------------------------------------------------------------------------
-# 5. 탭 구성 (일별 / 주말 / 주간 박스오피스)
-# ------------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📅 일별 박스오피스", "🗓️ 주말 박스오피스", "📆 주간 박스오피스"])
-
-with tab1:
-    daily_data, daily_err = fetch_daily_box_office(api_key, target_dt_str)
-    render_box_office_dashboard(daily_data, daily_err, "일별 박스오피스")
-
-with tab2:
-    weekend_data, weekend_err = fetch_weekly_box_office(api_key, target_dt_str, week_gb="1")
-    render_box_office_dashboard(weekend_data, weekend_err, "주말 박스오피스")
-
-with tab3:
-    weekly_data, weekly_err = fetch_weekly_box_office(api_key, target_dt_str, week_gb="0")
-    render_box_office_dashboard(weekly_data, weekly_err, "주간 박스오피스")
